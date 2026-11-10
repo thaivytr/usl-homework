@@ -1,7 +1,7 @@
-# usl-homework
 # Unsupervised Learning Homework
 
-**Homework descriptionz**
+**Homework description**
+
 Uber trip data:
 - Load the data [uber-data.csv].
 - Discover and comment clusters of uber data based on locations (longitude & latitude).
