@@ -1,0 +1,136 @@
+---
+title: "Unsupervised Learning | Course instructor: Assoc. Prof. Jacek Lewkowicz"
+subtitle: "Homework 1"
+author: "Thai Vy Tran - Student ID: 499880"
+date: "University of Warsaw - 2026/2027"
+
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: show
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+# Required libraries
+#install.packages(c("data.table","lubridate","knitr","rmarkdown"))
+
+#1. Load the data [uber-data.csv]
+```{r load-data}
+library(data.table)
+library(lubridate)
+
+uber<-fread("uber-data.csv",showProgress=FALSE)
+
+#show the first 6 observations
+knitr::kable(head(uber))
+
+#check the structure 
+str(uber)
+
+#summarize the data quality
+initial_summary <- data.table(
+  observations = nrow(uber),
+  variables = ncol(uber),
+  missing_values = sum(is.na(uber)),
+  duplicate_rows = sum(duplicated(uber)),
+  unique_bases = uniqueN(uber$Base)
+)
+
+knitr::kable(initial_summary)
+print(initial_summary)
+```
+
+The "uber-data.csv" contains 1,028,136 observations and 4 variables (no missing values). With 24,037 duplicate records and 5 unique Uber base codes. I kept the duplicates because identical records may represent separate trips.
+
+##a. Check datetime and geographic coordinates
+
+I am going to convert the date&time variable into a proper datetime format and check whether all timestamps are valid. Also check the latitude and longitude ranges to identify invalid geographical coordinates before spatial clustering.
+
+```{r check-coordinates}
+
+#convert date and time column
+uber[,datetime:=mdy_hms(`Date/Time`,tz="America/New_York")] #to use the NY local time zone 
+
+#check datetime validity & coverage
+datetime_check<-uber[,.(
+  invalid_datetime = sum(is.na(datetime)),
+  first_timestamp = min(datetime, na.rm = TRUE),
+  last_timestamp = max(datetime, na.rm = TRUE)
+)]
+
+knitr::kable(datetime_check)
+
+#check if geographic coordinate is valid
+coordinate_check <- uber[, .(
+  invalid_coordinates = sum(
+    !is.finite(Lat) | !is.finite(Lon) |
+    Lat < -90 | Lat > 90 |
+    Lon < -180 | Lon > 180
+  ),
+  min_latitude = min(Lat, na.rm = TRUE),
+  max_latitude = max(Lat, na.rm = TRUE),
+  min_longitude = min(Lon, na.rm = TRUE),
+  max_longitude = max(Lon, na.rm = TRUE)
+)]
+
+knitr::kable(coordinate_check)
+print(datetime_check)
+print(coordinate_check)
+```
+
+All timestamps were converted into datetime format, with 0 invalid values. The geographic coordinates are also valid, with latitude from 39.9897 to 41.3476 and longitude from -74.7736 to -72.7163.
+
+##b. Create time variables and check temporal coverage
+
+This step, we extract the date, hour, and day of the week from the datetime variable to support temporal clustering analysis and forecasting. Then, we also check the observation period and hourly coverage to see incomplete days.
+
+```{r time-coverage}
+
+#create temporal variables
+uber[,`:=`(
+  date = as.Date(datetime,tz="America/New_York"),
+  hour = lubridate::hour(datetime),
+  day_of_week = lubridate::wday(datetime, week_start = 1)
+)]
+
+#check first observations
+knitr::kable(head(uber[, .(datetime, date, hour, day_of_week)]))
+
+#summarize the observation period
+time_summary<-uber[, .(
+  first_timestamp = min(datetime),
+  last_timestamp = max(datetime),
+  total_dates = uniqueN(date),
+  total_hours = uniqueN(hour)
+)]
+
+print(time_summary)
+
+#check hourly coverage for each date
+hour_coverage <- uber[, .(
+  trips = .N,
+  observed_hours = uniqueN(hour)
+), by = date][order(date)]
+
+#display dates with incomplete hourly coverage
+print(hour_coverage[observed_hours < 24])
+```
+
+```{r check-datetime}
+print(uber[`Date/Time`=="9/1/2014 0:00:00",
+    .(original = `Date/Time`,
+       parsed = format(datetime, "%Y-%m-%d %H:%M:%S",
+                       tz = "America/New_York"))][1])
+```
+
+As we can see, the dataset covers 30 days in September 2014, with observations across all 24hrs of the day. September 30 contains only 23 observed hours (33,431 records).
+
+#2. Spatial clustering
+
+##a. Select algorithm and optimal clusters
