@@ -1,6 +1,5 @@
-# Unsupervised Learning Homework
-
-**Homework description**
+# Unsupervised Learning Homework 1
+https://rpubs.com/thaivytran/uber-forecasting
 
 Uber trip data:
 - Load the data [uber-data.csv].
