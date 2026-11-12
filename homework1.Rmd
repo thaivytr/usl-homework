@@ -44,7 +44,6 @@ initial_summary <- data.table(
 knitr::kable(initial_summary)
 print(initial_summary)
 ```
-
 The "uber-data.csv" contains 1,028,136 observations and 4 variables (no missing values). With 24,037 duplicate records and 5 unique Uber base codes. I kept the duplicates because identical records may represent separate trips.
 
 ## 1.1. Check datetime and geographic coordinates
@@ -54,7 +53,7 @@ I am going to convert the date&time variable into a proper datetime format and c
 ```{r check-coordinates}
 
 #convert date and time column
-uber[,datetime:=mdy_hms(`Date/Time`,tz="America/New_York")] #to use the NY local time zone 
+uber[,datetime:=mdy_hm(`Date/Time`,tz="America/New_York")] #to use the NY local time zone 
 
 #check datetime validity & coverage
 datetime_check<-uber[,.(
@@ -122,10 +121,11 @@ print(hour_coverage[observed_hours < 24])
 ```
 
 ```{r check-datetime}
-print(uber[`Date/Time`=="9/1/2014 0:00:00",
-    .(original = `Date/Time`,
-       parsed = format(datetime, "%Y-%m-%d %H:%M:%S",
-                       tz = "America/New_York"))][1])
+#check original and converted datetime
+print(head(uber[, .(original = `Date/Time`, parsed = datetime)]))
+
+#check datetime validity
+print(sum(is.na(uber$datetime)))
 ```
 
 As we can see, the dataset covers 30 days in September 2014, with observations across all 24hrs of the day. September 30 contains only 23 observed hours (33,431 records).
@@ -480,4 +480,116 @@ It shows recurring fluctuations, with clusters 5 & 8 accounting for most observa
 
 # 4. Apply the dataset for forecasting
 
-training&testing -> forecast ->
+## 4.1.	Data preparation
+
+For this data preparation step, we prepare hourly uber trip counts for each of the 8 geographical clusters and split the data into training (September 1–23) and testing (September 24–30) sets. Missing cluster-hour combinations are filled with 0, while hrs not observed in the original dataset are excluded to avoid misleading forecast evaluations.
+
+```{r data-preparation}
+#count hourly trips for each cluster
+trip_counts<-uber[, .(trips = .N), by = .(cluster, date, hour)]
+
+#create a complete hourly grid for all clusters
+observed_hours <- unique(uber[, .(date, hour)])
+forecast_data <- CJ(cluster = sort(unique(uber$cluster)), date = sort(unique(uber$date)), hour = 0:23)
+
+#exclude hours missing from the original dataset
+forecast_data <- merge(forecast_data, observed_hours, by = c("date", "hour"))
+
+#merge trip counts and fill missing cluster-hour counts with 0
+forecast_data <- merge(forecast_data, trip_counts, by = c("cluster", "date", "hour"), all.x = TRUE)
+forecast_data[is.na(trips), trips := 0L]
+setorder(forecast_data, cluster, date, hour)
+
+#split data into training and testing
+train_data <- forecast_data[date < as.Date("2014-09-24")]
+test_data <- forecast_data[date >= as.Date("2014-09-24")]
+
+#summarize training and testing
+split_summary <- rbindlist(list(
+  train_data[, .(period = "Train", first_date = min(date), last_date = max(date), hourly_rows = .N, trips = sum(trips))],
+  test_data[, .(period = "Test", first_date = min(date), last_date = max(date), hourly_rows = .N, trips = sum(trips))]
+))
+print(split_summary)
+
+#check hourly coverage
+print(forecast_data[, .(observed_hours = uniqueN(hour)), by = date][observed_hours < 24])
+
+#check aggregated trip counts
+stopifnot(sum(forecast_data$trips) == nrow(uber), !anyNA(forecast_data$trips))
+```
+Training (789,372 trips) and testing (238,764 trips). Hourly observations were prepared for all 8 clusters, with zero-trip hours included where appropriate. The incomplete hr on September 30 was excluded to ensure valid forecast evaluation.
+
+## 4.2. Cluster-based forecasting model
+
+We forecast hourly uber trip counts for each cluster using 2 methods (Seasonal Naive and Historical Hourly Profile). The first one uses observations from the same hr of the last week, while the second uses historical averages by cluster, weekday and hr (both use only training data to predict trips in the testing period).
+
+``` {r forecasting-model}
+#seasonal naive forecast using the previous week
+naive_lookup <- train_data[, .(cluster, date = date + 7L, hour, pred_naive = trips)]
+
+#add weekday information
+train_data[, weekday := lubridate::wday(date, week_start = 1)]
+test_data[, weekday := lubridate::wday(date, week_start = 1)]
+
+#historical hourly averages
+hourly_profile <- train_data[, .(pred_profile = mean(trips)), by = .(cluster, weekday, hour)]
+
+#generate forecasts for the testing period
+forecast_results <- merge(test_data, naive_lookup, by = c("cluster","date","hour"), all.x = TRUE)
+forecast_results <- merge(forecast_results, hourly_profile, by = c("cluster","weekday","hour"), all.x = TRUE)
+forecast_results[, pred_profile := round(pred_profile)]
+setorder(forecast_results, cluster, date, hour)
+
+#check results
+stopifnot(nrow(forecast_results) == nrow(test_data), !anyNA(forecast_results[, .(pred_naive, pred_profile)]))
+
+#show actual vs predicted trips
+print(head(forecast_results[, .(cluster, date, hour, trips, pred_naive, pred_profile)], 12))
+```
+Both methods generated hourly trip forecasts for all 8 clusters during the testing. All predictions are available, and they use only historical training data.
+
+## 4.3. Visualization
+
+We're going to use MAE, RMSE and WAPE to evaluate the forecasting accuracy of Seasonal Naive and Historical Hourly Profile. Then, compare actual and predicted hourly trip counts to see which method performs better during the testing.
+
+```{r visualization}
+#forecasting error metrics
+evaluate<-function(pred, label) {
+  err <- forecast_results$trips - pred
+  data.table(method = label, MAE = round(mean(abs(err)), 2),
+             RMSE = round(sqrt(mean(err^2)), 2),
+             WAPE = round(100 * sum(abs(err)) / sum(forecast_results$trips), 2))
+}
+
+#compare forecasting methods
+evaluation <- rbindlist(list(
+  evaluate(forecast_results$pred_naive, "Seasonal Naive"),
+  evaluate(forecast_results$pred_profile, "Historical hourly profile")
+))
+print(evaluation)
+knitr::kable(evaluation)
+
+#aggregate actual and predicted trips across clusters
+plot_forecast <- forecast_results[, .(Actual = sum(trips),
+  Seasonal_Naive = sum(pred_naive),
+  Historical_Profile = sum(pred_profile)), by = .(date, hour)]
+
+#create hourly timestamps
+plot_forecast[, datetime := as.POSIXct(paste(date, sprintf("%02d:00:00", hour)),
+  format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York")]
+
+#prepare data
+plot_long <- melt(plot_forecast, id.vars = "datetime",
+  measure.vars = c("Actual", "Seasonal_Naive", "Historical_Profile"),
+  variable.name = "method", value.name = "trips")
+
+#visualize actual vs predicted trips
+ggplot(plot_long, aes(x = datetime, y = trips, color = method)) +
+  geom_line(linewidth = 0.6) +
+  scale_x_datetime(date_breaks = "1 day", date_labels = "%d %b") +
+  labs(title = "Actual vs Predicted hourly uber trips",
+       x = "Date", y = "Number of trips", color = "Method") +
+  theme_minimal()
+```
+
+The Historical Hourly Profile performs better than Seasonal Naive, with lower MAE (25.30), RMSE (55.02) and WAPE (14.16%). Both methods capture hourly trip patterns, but forecasting accuracy is limited by the short period.
