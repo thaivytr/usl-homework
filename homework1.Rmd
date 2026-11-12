@@ -1,6 +1,6 @@
 ---
-title: "Unsupervised Learning | Course instructor: Assoc. Prof. Jacek Lewkowicz"
-subtitle: "Homework 1"
+title: "Unsupervised Learning"
+subtitle: "Homework 1 | Course instructor: Assoc. Prof. Jacek Lewkowicz"
 author: "Thai Vy Tran - Student ID: 499880"
 date: "University of Warsaw - 2026/2027"
 
@@ -14,19 +14,18 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-```
-
-## R Markdown
-# Required libraries
-#install.packages(c("data.table","lubridate","knitr","rmarkdown"))
-
-#1. Load the data [uber-data.csv]
-```{r load-data}
+#required lib
 library(data.table)
 library(lubridate)
+library(sf)
+library(ggplot2)
+library(cluster)
+```
 
+# 1. Load the data [uber-data.csv]
+
+```{r load-data}
 uber<-fread("uber-data.csv",showProgress=FALSE)
-
 #show the first 6 observations
 knitr::kable(head(uber))
 
@@ -48,7 +47,7 @@ print(initial_summary)
 
 The "uber-data.csv" contains 1,028,136 observations and 4 variables (no missing values). With 24,037 duplicate records and 5 unique Uber base codes. I kept the duplicates because identical records may represent separate trips.
 
-##a. Check datetime and geographic coordinates
+## 1.1. Check datetime and geographic coordinates
 
 I am going to convert the date&time variable into a proper datetime format and check whether all timestamps are valid. Also check the latitude and longitude ranges to identify invalid geographical coordinates before spatial clustering.
 
@@ -86,7 +85,7 @@ print(coordinate_check)
 
 All timestamps were converted into datetime format, with 0 invalid values. The geographic coordinates are also valid, with latitude from 39.9897 to 41.3476 and longitude from -74.7736 to -72.7163.
 
-##b. Create time variables and check temporal coverage
+## 1.2. Create time variables and check temporal coverage
 
 This step, we extract the date, hour, and day of the week from the datetime variable to support temporal clustering analysis and forecasting. Then, we also check the observation period and hourly coverage to see incomplete days.
 
@@ -131,6 +130,354 @@ print(uber[`Date/Time`=="9/1/2014 0:00:00",
 
 As we can see, the dataset covers 30 days in September 2014, with observations across all 24hrs of the day. September 30 contains only 23 observed hours (33,431 records).
 
-#2. Spatial clustering
+# 2. Spatial clustering
 
-##a. Select algorithm and optimal clusters
+## 2.1. Select algorithm and optimal clusters
+
+We use K-means to identify geographical groups of uber trips based on lat and lon. I believe K-means is suitable for this analysis because it provides cluster centers that can be used in the subsequent temporal analysis and forecasting.
+
+To specify number of clusters, we compare different values of k using the Elbow Method, Silhouette Score, and Calinski–Harabasz Index. Since the dataset is large, model selection is performed on a reproducible random sample of training observations.
+
+```{r spatial-clustering}
+
+#select training observations
+train_rows<-which(uber$date < as.Date("2014-09-24"))
+
+#create a reproducible sample for model selection
+set.seed(42)
+sample_rows <- sample(train_rows, size = min(20000, length(train_rows)))
+sample_data <- uber[sample_rows, .(Lon, Lat)]
+
+#convert coordinates to a projected system in meters
+sample_sf <- st_as_sf(
+  sample_data,
+  coords = c("Lon", "Lat"),
+  crs = 4326
+)
+
+sample_sf <- st_transform(sample_sf, crs = 32618)
+X <- st_coordinates(sample_sf)
+
+#select observations for Silhouette evaluation
+set.seed(42)
+sil_rows <- sample(seq_len(nrow(X)), size = 1000)
+sil_dist <- dist(X[sil_rows, , drop = FALSE])
+
+#test different numbers of clusters
+k_values <- 2:12
+
+k_results <- data.table::rbindlist(lapply(k_values, function(k) {
+
+  #fit K-means for the current number of clusters
+  model <- kmeans(X, centers = k, nstart = 10, iter.max = 500, algorithm = "Lloyd")
+
+  #calculate average Silhouette Score
+  sil <- cluster::silhouette(model$cluster[sil_rows], sil_dist)
+  avg_sil <- mean(sil[, "sil_width"])
+
+  #calculate Calinski-Harabasz Index
+  ch <- (model$betweenss / (k - 1)) /
+        (model$tot.withinss / (nrow(X) - k))
+
+  data.table::data.table(
+    k = k,
+    inertia = model$tot.withinss,
+    silhouette = avg_sil,
+    calinski_harabasz = ch
+  )
+}))
+
+#display quality measures
+print(round(k_results, 3))
+
+#plot Elbow Method
+ggplot(k_results, aes(x = k, y = inertia)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = k_values) +
+  labs(title = "Elbow Method", x = "Number of clusters",
+       y = "Within-Cluster Sum of Squares") +
+  theme_minimal()
+
+#plot Silhouette Scores
+ggplot(k_results, aes(x = k, y = silhouette)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = k_values) +
+  labs(title = "Silhouette Score by Number ofclusters",
+       x = "Number of Clusters", y = "Average Silhouette") +
+  theme_minimal()
+```
+
+```{r check-cluster}
+#compare cluster sizes for k=5 & k=8
+set.seed(42)
+model_5 <- kmeans(X, centers = 5, nstart = 10,iter.max = 500, algorithm = "Lloyd")
+
+model_8 <- kmeans(X, centers = 8, nstart = 10,iter.max = 500, algorithm = "Lloyd")
+
+#calculate cluster sizes,  percentages and display
+print(size_5 <- data.table(
+  cluster = 1:5,
+  count = model_5$size,
+  percentage = round(100 * model_5$size / nrow(X), 2)
+))
+
+print(size_8 <- data.table(
+  cluster = 1:8,
+  count = model_8$size,
+  percentage = round(100 * model_8$size / nrow(X), 2)
+))
+```
+The Elbow Method doesn't show a clear optimal number of clusters. Although k=2 gets the highest Silhouette score =0.652 (limited geographical detail).
+
+Among the larger solutions, k=8 gets a slightly higher Silhouette Score =0.449 than k=5 0.439. However, k=8 also produces a very small cluster (only 0.36% of the sampled observations).
+
+Both solutions show unequal cluster sizes. Therefore, for now we will keep k=5 and k=8 for further geographical evaluation.
+
+## 2.2. Check clustering results and quality
+
+We compare the clustering results for k=5 and k=8 using the Silhouette Score, Calinski–Harabasz Index, and within-cluster sum of squares.
+
+```{r clustering-results-and-quality}
+#compare clustering quality
+models<-list(model_5, model_8)
+
+quality_results <- rbindlist(lapply(seq_along(models), function(i) {
+  model <- models[[i]]
+  k <- c(5, 8)[i]
+
+  #Silhouette Score
+  sil <- silhouette(model$cluster[sil_rows], sil_dist)
+
+  #Calinski-Harabasz Index
+  ch <- (model$betweenss / (k - 1)) /
+    (model$tot.withinss / (nrow(X) - k))
+
+  data.table(
+    k = k,
+    inertia = round(model$tot.withinss, 2),
+    silhouette = round(mean(sil[, "sil_width"]), 3),
+    calinski_harabasz = round(ch, 2)
+  )
+}))
+
+print(quality_results)
+
+#extract cluster centers and sizes
+centers <- rbindlist(list(
+  data.table(
+    solution = "k = 5",
+    cluster = 1:5,
+    x = model_5$centers[, 1],
+    y = model_5$centers[, 2],
+    count = model_5$size
+  ),
+  data.table(
+    solution = "k = 8",
+    cluster = 1:8,
+    x = model_8$centers[, 1],
+    y = model_8$centers[, 2],
+    count = model_8$size
+  )
+))
+
+#convert cluster centers back to longitude and latitude
+centers_sf <- st_as_sf(
+  centers, coords = c("x", "y"), crs = 32618
+)
+
+centers_sf <- st_transform(centers_sf, 4326)
+center_coords <- st_coordinates(centers_sf)
+
+centers[, `:=`(
+  Lon = center_coords[, 1],
+  Lat = center_coords[, 2],
+  percentage = round(100 * count / nrow(X), 2)
+)]
+
+#display cluster centers
+print(centers[, .(
+  solution, cluster, Lon, Lat, count, percentage
+)])
+
+#sample observations for geographic visualization
+set.seed(42)
+plot_rows <- sample(seq_len(nrow(X)), 7000)
+
+plot_data <- rbindlist(list(
+  data.table(
+    Lon = sample_data$Lon[plot_rows],
+    Lat = sample_data$Lat[plot_rows],
+    cluster = factor(model_5$cluster[plot_rows]),
+    solution = "k = 5"
+  ),
+  data.table(
+    Lon = sample_data$Lon[plot_rows],
+    Lat = sample_data$Lat[plot_rows],
+    cluster = factor(model_8$cluster[plot_rows]),
+    solution = "k = 8"
+  )
+))
+
+#visualize
+ggplot(plot_data, aes(x = Lon, y = Lat, color = cluster)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  geom_point(
+    data = centers,
+    aes(x = Lon, y = Lat),
+    inherit.aes = FALSE,
+    shape = 4,
+    color = "black",
+    size = 3,
+    stroke = 1.2
+  ) +
+  facet_wrap(~solution) +
+  coord_quickmap() +
+  labs(
+    title = "Geographical Clustering",
+    subtitle = "Black crosses indicate cluster centers",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+
+```
+k=8 solution gets a higher Silhouette Score 0.449 and Calinski–Harabasz Index 12,192.63 than k=5 (0.429 and 9,937.13,)
+
+The geographical visualization shows k=8 provides a more detailed spatial separation of uber trip locations.
+
+Based on the results, I'll choose k=8 for further analysis.
+
+## 2.3. Cluster visualization
+
+Use k=8 clustering model to the dataset using the established cluster centers then examine the number of trips in each cluster and visualize their geographical distribution to check the main areas of uber activity.
+
+``` {r cluster-visualization}
+#project geographic coordinates
+xy<-sf::sf_project("EPSG:4326", "EPSG:32618", as.matrix(uber[, .(Lon, Lat)]))
+
+#assign observations to nearest cluster center
+nearest_dist <- rep(Inf, nrow(uber))
+uber[, cluster := NA_integer_]
+
+for (i in 1:8) {
+  d <- (xy[, 1] - model_8$centers[i, 1])^2 + (xy[, 2] - model_8$centers[i, 2])^2
+  nearest <- d < nearest_dist
+  uber[nearest, cluster := i]
+  nearest_dist[nearest] <- d[nearest]
+}
+
+#remove temporary objects
+rm(xy, d, nearest, nearest_dist)
+
+#summarize cluster sizes and centers
+final_summary <- uber[, .(trips = .N), by = cluster][order(cluster)]
+final_summary[, percentage := round(100 * trips / sum(trips), 2)]
+final_summary <- merge(final_summary, centers[solution == "k = 8", .(cluster, Lon, Lat)], by = "cluster")
+
+print(final_summary)
+knitr::kable(final_summary, digits = 4)
+
+#sample observations for visualization
+set.seed(42)
+plot_final <- uber[sample.int(nrow(uber), 15000), .(Lon, Lat, cluster)]
+
+#visualize final clusters and their centers
+ggplot(plot_final, aes(x = Lon, y = Lat, color = factor(cluster))) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  geom_point(data = final_summary, aes(x = Lon, y = Lat), inherit.aes = FALSE, shape = 4, color = "black", size = 3) +
+  geom_text(data = final_summary, aes(x = Lon, y = Lat, label = cluster), inherit.aes = FALSE, nudge_y = 0.025, size = 3) +
+  coord_quickmap() +
+  labs(title = "Clustering k=8", x = "Longitude", y = "Latitude", color = "Cluster") +
+  theme_minimal()
+```
+k=8 model was applied to all 1,028,136 uber observations. Clusters 5 & 8 contain the majority of trips 78.68%, showing a strong concentration of uber activity in central New York City. 6 is the smallest 0.34% and represents a more distant geographical area. Overall, the results reveal an uneven spatial distribution of uber trips across the eight clusters.
+
+# 3. Analyze the cluster centers by time and date
+
+## 3.1. By time
+
+We analyze uber trip activity and the geographical centers of the 8 clusters across different hrs of the day. For each cluster and hr, we calculate the number of trips and the average geographical location and also measure how far these hourly centers are from the original cluster centers to identify temporal changes in spatial activity.
+
+``` {r by-time}
+#convert coordinates to meters
+xy<-sf::sf_project("EPSG:4326", "EPSG:32618", as.matrix(uber[, .(Lon, Lat)]))
+uber[, `:=`(x = xy[, 1], y = xy[, 2])]
+rm(xy)
+
+#hourly cluster centers
+hourly_centers <- uber[, .(trips = .N, center_x = mean(x), center_y = mean(y)), by = .(cluster, hour)][order(cluster, hour)]
+
+#distance from the original cluster center
+hourly_centers[, shift_km := sqrt((center_x - model_8$centers[cluster, 1])^2 + (center_y - model_8$centers[cluster, 2])^2) / 1000]
+
+#identify the busiest hour for each cluster
+peak_hours <- hourly_centers[, .SD[which.max(trips)], by = cluster][, .(cluster, peak_hour = hour, peak_trips = trips)]
+print(peak_hours)
+
+#summarize hourly activity and center shifts
+hourly_summary <- hourly_centers[, .(min_trips = min(trips), max_trips = max(trips), mean_shift_km = round(mean(shift_km), 2)), by = cluster]
+print(hourly_summary)
+
+#hourly trip activity
+ggplot(hourly_centers, aes(x = hour, y = factor(cluster), fill = trips)) +
+  geom_tile() +
+  scale_x_continuous(breaks = seq(0, 23, by = 2)) +
+  labs(title = "Hourly uber trip activity by cluster", x = "hour", y = "cluster", fill = "trips") +
+  theme_minimal()
+
+#hourly center shifts
+ggplot(hourly_centers, aes(x = hour, y = shift_km, color = factor(cluster))) +
+  geom_line() + geom_point(size = 0.8) +
+  facet_wrap(~cluster, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 23, by = 6)) +
+  labs(title = "Hourly changes in cluster centers", x = "hour", y = "distance from original center (km)") +
+  theme_minimal() + theme(legend.position = "none")
+```
+It shows uber trip activity varies across clusters throughout the day. Clusters 5 & 8 show the highest activity (peak at 17:00 and 18:00), while clusters 3 and 4 peak at 21:00.
+
+The geographical centers also show different levels of hourly variation. Cluster 8 keeps stable (average 0.11km), while cluster 6 has the largest variation (2.95 km), probably due to its smaller number of observations.
+
+## 3.2. By date
+
+Similar to section (a), we analyze daily uber trip activity and changes in cluster centers from September 1 to 30, 2014.
+
+``` {r by-date}
+#daily cluster centers
+daily_centers <- uber[, .(trips = .N, center_x = mean(x), center_y = mean(y)), by = .(cluster, date)][order(cluster, date)]
+
+#distance from the original cluster center
+daily_centers[, shift_km := sqrt((center_x - model_8$centers[cluster, 1])^2 + (center_y - model_8$centers[cluster, 2])^2) / 1000]
+
+#identify the busiest date for each cluster
+peak_dates <- daily_centers[, .SD[which.max(trips)], by = cluster][, .(cluster, peak_date = date, peak_trips = trips)]
+print(peak_dates)
+
+#summarize daily activity and center shifts
+daily_summary <- daily_centers[, .(total_trips = sum(trips), mean_daily_trips = round(mean(trips), 1), mean_shift_km = round(mean(shift_km), 2)), by = cluster]
+print(daily_summary)
+
+#daily trip activity
+ggplot(daily_centers, aes(x = date, y = trips, color = factor(cluster))) +
+  geom_line() + geom_point(size = 0.6) +
+  facet_wrap(~cluster, scales = "free_y") +
+  scale_x_date(date_breaks = "7 days", date_labels = "%d %b") +
+  labs(title = "Daily uber trip activity by cluster", x = "date", y = "number of trips") +
+  theme_minimal() + theme(legend.position = "none")
+
+#daily center shifts
+ggplot(daily_centers, aes(x = date, y = shift_km, color = factor(cluster))) +
+  geom_line() + geom_point(size = 0.6) +
+  facet_wrap(~cluster, scales = "free_y") +
+  scale_x_date(date_breaks = "7 days", date_labels = "%d %b") +
+  labs(title = "Daily changes in cluster centers", x = "date", y = "Distance from Original Center (km)") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+It shows recurring fluctuations, with clusters 5 & 8 accounting for most observations. 8 has the most stable geographical center (0.06 km average shift), while 6 shows the largest variation (2.89 km), likely due to fewer observations. 
+
+# 4. Apply the dataset for forecasting
+
+training&testing -> forecast ->
